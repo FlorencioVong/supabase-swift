@@ -71,6 +71,12 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
     /// `true` — otherwise foregrounding a client that was intentionally idle
     /// would spuriously open a connection.
     var wasConnectedBeforeBackground: Bool = false
+
+    var lastHeartbeatStatus: HeartbeatStatus?
+    var heartbeatStatusContinuations: [(UUID, AsyncStream<HeartbeatStatus>.Continuation)] = []
+
+    var status: RealtimeClientStatus = .disconnected
+    var statusContinuations: [(UUID, AsyncStream<RealtimeClientStatus>.Continuation)] = []
   }
 
   let url: URL
@@ -91,55 +97,11 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
     mutableState.channels
   }
 
-  private let statusSubject = AsyncValueSubject<RealtimeClientStatus>(.disconnected)
-  private let heartbeatSubject = AsyncValueSubject<HeartbeatStatus?>(nil)
-
-  /// Listen for connection status changes.
+  /// Creates a new ``RealtimeClientV2`` using the default URLSession WebSocket transport.
   ///
-  /// You can also use ``onStatusChange(_:)`` for a closure based method.
-  public var statusChange: AsyncStream<RealtimeClientStatus> {
-    statusSubject.values
-  }
-
-  /// The current connection status.
-  public var status: RealtimeClientStatus {
-    statusSubject.value
-  }
-
-  /// Listen for heartbeat status.
-  ///
-  /// You can also use ``onHeartbeat(_:)`` for a closure based method.
-  public var heartbeat: AsyncStream<HeartbeatStatus> {
-    AsyncStream(heartbeatSubject.values.compactMap { $0 })
-  }
-
-  /// Listen for connection status changes.
-  /// - Parameter listener: Closure that will be called when connection status changes.
-  /// - Returns: An observation handle that can be used to stop listening.
-  ///
-  /// - Note: Use ``statusChange`` if you prefer to use Async/Await.
-  public func onStatusChange(
-    _ listener: @escaping @Sendable (RealtimeClientStatus) -> Void
-  ) -> RealtimeSubscription {
-    let task = statusSubject.onChange { listener($0) }
-    return RealtimeSubscription { task.cancel() }
-  }
-
-  /// Listen for heartbeat checks.
-  /// - Parameter listener: Closure that will be called when heartbeat status changes.
-  /// - Returns: An observation handle that can be used to stop listening.
-  ///
-  /// - Note: Use ``heartbeat`` if you prefer to use Async/Await.
-  public func onHeartbeat(
-    _ listener: @escaping @Sendable (HeartbeatStatus) -> Void
-  ) -> RealtimeSubscription {
-    let task = heartbeatSubject.onChange { message in
-      guard let message else { return }
-      listener(message)
-    }
-    return RealtimeSubscription { task.cancel() }
-  }
-
+  /// - Parameters:
+  ///   - url: The Realtime server URL (e.g. `https://<project>.supabase.co/realtime/v1`).
+  ///   - options: Configuration options for the client.
   public convenience init(url: URL, options: RealtimeClientOptions) {
     var interceptors: [any HTTPClientInterceptor] = []
 
@@ -204,7 +166,7 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
       clock: clock
     )
 
-    let stateObserverTask = Task { [weak self, connectionManager, statusSubject] in
+    let stateObserverTask = Task { [weak self, connectionManager] in
       var sawReconnecting = false
       for await state in connectionManager.stateChanges {
         guard let self else { return }
@@ -216,17 +178,17 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
           if sawReconnecting {
             self.handleConnected(conn: conn, isReconnect: true)
             sawReconnecting = false
-            Self.yieldStatusIfChanged(statusSubject, .connected)
+            self.yieldStatusIfChanged(.connected)
           }
         case .disconnected:
-          Self.yieldStatusIfChanged(statusSubject, .disconnected)
+          self.yieldStatusIfChanged(.disconnected)
         case .connecting:
           // Skip — `connect()` yields .connecting/.connected synchronously
           // before returning, so the observer would otherwise double-emit.
           break
         case .reconnecting:
           sawReconnecting = true
-          Self.yieldStatusIfChanged(statusSubject, .connecting)
+          self.yieldStatusIfChanged(.connecting)
         }
       }
     }
@@ -241,15 +203,6 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
         mutableState.withValue { $0.lifecycleManager = manager }
       }
     #endif
-  }
-
-  private static func yieldStatusIfChanged(
-    _ subject: AsyncValueSubject<RealtimeClientStatus>,
-    _ status: RealtimeClientStatus
-  ) {
-    if subject.value != status {
-      subject.yield(status)
-    }
   }
 
   private func handleConnected(conn: any WebSocket, isReconnect: Bool) {
@@ -282,12 +235,28 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
   }
 
   deinit {
-    mutableState.withValue {
-      $0.heartbeatTask?.cancel()
-      $0.messageTask?.cancel()
-      $0.stateObserverTask?.cancel()
-      $0.pendingDisconnectTask?.cancel()
-      $0.channels = [:]
+    let (statusContinuations, heartbeatStatusContinuations) = mutableState.withValue {
+      state -> (
+        [AsyncStream<RealtimeClientStatus>.Continuation],
+        [AsyncStream<HeartbeatStatus>.Continuation]
+      ) in
+      state.heartbeatTask?.cancel()
+      state.messageTask?.cancel()
+      state.stateObserverTask?.cancel()
+      state.pendingDisconnectTask?.cancel()
+      state.channels = [:]
+
+      defer {
+        state.statusContinuations.removeAll()
+        state.heartbeatStatusContinuations.removeAll()
+      }
+      return (state.statusContinuations.map { $1 }, state.heartbeatStatusContinuations.map { $1 })
+    }
+    for continuation in statusContinuations {
+      continuation.finish()
+    }
+    for continuation in heartbeatStatusContinuations {
+      continuation.finish()
     }
   }
 
@@ -296,7 +265,7 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
   /// Suspends until connected.
   public func connect() async {
     options.logger?.debug("Connecting...")
-    Self.yieldStatusIfChanged(statusSubject, .connecting)
+    self.yieldStatusIfChanged(.connecting)
 
     do {
       let conn = try await connectionManager.connect()
@@ -306,10 +275,10 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
       // synchronously so callers can rely on state being ready after connect()
       // returns, even if the state observer task hasn't caught up yet.
       handleConnected(conn: conn, isReconnect: false)
-      Self.yieldStatusIfChanged(statusSubject, .connected)
+      self.yieldStatusIfChanged(.connected)
     } catch {
       options.logger?.error("Connection failed: \(error)")
-      Self.yieldStatusIfChanged(statusSubject, .disconnected)
+      self.yieldStatusIfChanged(.disconnected)
     }
   }
 
@@ -524,7 +493,7 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
 
   private func sendHeartbeat() async {
     if status != .connected {
-      heartbeatSubject.yield(.disconnected)
+      yieldHeartbeatStatus(.disconnected)
       return
     }
 
@@ -552,12 +521,12 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
           payload: [:]
         )
       )
-      heartbeatSubject.yield(.sent)
+      yieldHeartbeatStatus(.sent)
       await setAuth()
     } else {
       // Timeout: previous heartbeat was never acknowledged
       options.logger?.debug("Heartbeat timeout - previous heartbeat not acknowledged")
-      heartbeatSubject.yield(.timeout)
+      yieldHeartbeatStatus(.timeout)
 
       // Clear the pending ref before reconnecting
       mutableState.withValue { $0.pendingHeartbeatRef = nil }
@@ -592,7 +561,7 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
       $0.wasConnectedBeforeBackground = false
     }
 
-    Self.yieldStatusIfChanged(statusSubject, .disconnected)
+    self.yieldStatusIfChanged(.disconnected)
 
     Task { [connectionManager, reason] in
       await connectionManager.disconnect(reason: reason ?? "Client disconnect")
@@ -671,7 +640,7 @@ public final class RealtimeClientV2: Sendable, RealtimeClientProtocol {
 
   private func onMessage(_ message: RealtimeMessageV2) async {
     if message.topic == "phoenix", message.event == "phx_reply" {
-      heartbeatSubject.yield(message.status == .ok ? .ok : .error)
+      yieldHeartbeatStatus(message.status == .ok ? .ok : .error)
     }
 
     let channel = mutableState.withValue {
